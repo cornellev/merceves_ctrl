@@ -24,7 +24,7 @@ class SPINode : public rclcpp::Node {
 	double left_speed, right_speed;
 
     void handle_ackermann_update(const ackermann_msgs::msg::AckermannDrive::SharedPtr msg) {
-        RCLCPP_INFO(this->get_logger(), "Received Ackermann Drive - Speed: '%f', Steering Angle: '%f'", msg->speed, msg->steering_angle);
+        //RCLCPP_INFO(this->get_logger(), "Received Ackermann Drive - Speed: '%f', Steering Angle: '%f'", msg->speed, msg->steering_angle);
         double speed = msg->speed;
         double steering_angle = msg->steering_angle;
         // covnvert speed and steering angle to SPI data
@@ -69,9 +69,11 @@ class SPINode : public rclcpp::Node {
 	*/
 
 	std::vector<uint8_t> rx_data = spi.transfer(tx_data);
+        
+        checksum:
 	checksum = 0;
 	for(std::size_t i = 1; i < rx_data.size() - 1; ++i) {
-	    checksum ^= rx_data[i];
+             checksum ^= rx_data[i];
 	}
 
 	if(checksum == rx_data[rx_data.size() - 1]) {
@@ -91,10 +93,31 @@ class SPINode : public rclcpp::Node {
 
 	} else {
 	    RCLCPP_ERROR(this->get_logger(), "SPI checksum failed :(");
+	    std::vector<uint8_t> header_byte;
+	    header_byte.reserve(1);
+	    header_byte.push_back(0xAA);
+
+	    std::vector<uint8_t> tx_data_truncated;
+	    tx_data_truncated.reserve(17);
+	    for(int i = 0; i < 17; i++) {
+                tx_data_truncated[i] = tx_data[i+1];
+	    }
+
+	    bool misaligned = true;
+	    while(misaligned) {
+	        std::vector<uint8_t> header_back = spi.transfer(header_byte);
+		if(header_back[0] == 0xAA) {
+		    std::vector<uint8_t> other_data = spi.transfer(tx_data_truncated);
+		    misaligned = false;
+		}
+	    }
+	    goto checksum;
 	}
 
-	RCLCPP_INFO(this->get_logger(), "Left speed: %lf, Right speed: %lf", left_speed, right_speed);
-	RCLCPP_INFO(this->get_logger(), "RX: %s", ([&]{ std::ostringstream s; for(uint8_t b : rx_data) s << std::hex << std::setw(2) << std::setfill('0') << (int)b << " "; return s.str(); })().c_str());
+	if(left_speed > 0 || right_speed > 0) {
+		RCLCPP_INFO(this->get_logger(), "Left speed: %lf, Right speed: %lf", left_speed, right_speed);
+	}
+	// RCLCPP_INFO(this->get_logger(), "RX: %s", ([&]{ std::ostringstream s; for(uint8_t b : rx_data) s << std::hex << std::setw(2) << std::setfill('0') << (int)b << " "; return s.str(); })().c_str());
     }
 
     rclcpp::Subscription<ackermann_msgs::msg::AckermannDrive>::SharedPtr subscription_;
