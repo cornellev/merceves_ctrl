@@ -38,6 +38,7 @@
 
 const double m_pi = 3.14159265358979323846f;
 
+// stepper motor parameters
 const int steps_per_rev = 1600;
 const int margin_of_error = 2;
 
@@ -48,10 +49,12 @@ volatile int current_step_angle;
 volatile int pulse_count_L = 0;
 volatile int pulse_count_R = 0;
 
+// for incoming data over SPI
 volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
 volatile int requested_angle = 800;
 
+// data being sent back over SPI
 volatile double speed_L = 0;
 volatile double speed_R = 0;
 
@@ -59,10 +62,12 @@ const int magnets_per_wheel = 68;
 
 volatile bool spi_transfer_requested = false;
 
+// polling potentiometer data, only for testing
 static inline int pollADC() {
     return floorf((adc_read() * steps_per_rev) / 4095.0f);
 }
 
+// uptime
 int time_ms() {
     return to_ms_since_boot(get_absolute_time());
 }
@@ -86,11 +91,14 @@ void handle_spi_transfer() {
 
     //printf("reading...\n");
 
+    // 1 byte at at time for now
+    uint8_t byte_freq = 1;
+
     for (int i = 0; i < 18; i++) {
         uint8_t b = 0;
         //printf("reading %d byte\n", i);
 
-        spi_read_blocking(spi0, tx_buffer[i], &b, 1);
+        spi_read_blocking(spi0, tx_buffer[i], &b, byte_freq);
         //printf("read %d byte\n", i);
         rx_buffer[i] = b;
     }
@@ -112,6 +120,7 @@ void handle_spi_transfer() {
 
     //printf("\n");
 
+    // checksum failure logic
     if(checksum != rx_buffer[17]) {
         //printf("checksum failed :(");
         uint8_t b = 0;
@@ -148,7 +157,7 @@ void handle_spi_transfer() {
 
     requested_angle = (int)(400.0f * ((angle_cmd + (m_pi/2.0f)) / (m_pi))) + 600;
 
-    printf("requested speed: %lf, requested angle: %lf", requested_speed, requested_angle);
+    printf("requested speed: %lf, requested angle: %lf\n", requested_speed, requested_angle);
 }
 
 void gpio_interrupt(uint gpio, uint32_t events) {
