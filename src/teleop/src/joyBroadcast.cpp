@@ -23,7 +23,7 @@ class VelocityTranslator : public rclcpp::Node
     void topic_callback(const sensor_msgs::msg::Joy & msg) const
     {
       float velocity = -1.0 * 2048.0 * (msg.axes[5] - 1);
-      if(msg.axes[2] < .9f) { velocity *= -1; }
+      if(msg.axes[4] < .5f) { velocity *= -1; }
       //RCLCPP_INFO(this->get_logger(), "I heard: '%f'", velocity);
       auto message = ackermann_msgs::msg::AckermannDrive();
       message.speed = velocity;
