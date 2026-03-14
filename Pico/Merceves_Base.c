@@ -74,7 +74,6 @@ void handle_spi_transfer() {
 
     tx_buffer[0] = 0xAA;
 
-    speed_L = 10.5f;
     memcpy(&tx_buffer[1], &speed_L, sizeof(double));
     memcpy(&tx_buffer[9], &speed_R, sizeof(double));
 
@@ -148,16 +147,15 @@ void handle_spi_transfer() {
 
     requested_angle = (int)(400.0f * ((angle_cmd + (m_pi/2.0f)) / (m_pi))) + 600;
 
-    printf("requested speed: %lf, requested angle: %lf", requested_speed, requested_angle);
+    printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed_cmd, angle_cmd, requested_speed, requested_angle);
 }
 
 void gpio_interrupt(uint gpio, uint32_t events) {
-
-    if(gpio == RPM_PIN_L && events == GPIO_IRQ_EDGE_RISE) {
+    if(gpio == RPM_PIN_L && (events & GPIO_IRQ_EDGE_RISE)) {
         pulse_count_L++;
     }
 
-    if(gpio == RPM_PIN_R && events == GPIO_IRQ_EDGE_RISE) {
+    if(gpio == RPM_PIN_R && (events & GPIO_IRQ_EDGE_RISE)) {
         pulse_count_R++;
     }
 }
