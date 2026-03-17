@@ -36,6 +36,8 @@
 #define SPI_RX 8
 #define SPI_CS 9
 
+#define LED_PIN 25
+
 const double m_pi = 3.14159265358979323846f;
 
 const int steps_per_rev = 1600;
@@ -222,6 +224,9 @@ int main() {
     gpio_set_function(19, GPIO_FUNC_SPI);
     gpio_set_function(18, GPIO_FUNC_SPI);
 
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 1);
     
     multicore_launch_core1(core1_entry);
 
