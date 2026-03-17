@@ -97,19 +97,25 @@ class SPINode : public rclcpp::Node {
 	    header_byte.reserve(1);
 	    header_byte.push_back(0xAA);
 
-	    std::vector<uint8_t> tx_data_truncated;
-	    tx_data_truncated.reserve(17);
-	    for(int i = 0; i < 17; i++) {
-                tx_data_truncated[i] = tx_data[i+1];
-	    }
+	    std::vector<uint8_t> tx_data_truncated(
+		tx_data.begin() + 1,
+		tx_data.begin() + 18
+	    );
 
 	    bool misaligned = true;
+	    std::vector<uint8_t> other_data;
+	    other_data.reserve(17);
 	    while(misaligned) {
 	        std::vector<uint8_t> header_back = spi.transfer(header_byte);
 		if(header_back[0] == 0xAA) {
-		    std::vector<uint8_t> other_data = spi.transfer(tx_data_truncated);
+		    other_data = spi.transfer(tx_data_truncated);
 		    misaligned = false;
 		}
+	    }
+            rx_data[0] = 0xAA;
+	    RCLCPP_INFO(this->get_logger(), "length of other_data: %ld", other_data.size());
+	    for(int i = 0; i < 17; i++) {
+                rx_data[i+1] = other_data[i];
 	    }
 	    goto checksum;
 	}
