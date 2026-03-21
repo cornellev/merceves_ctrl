@@ -28,10 +28,10 @@
 
 // spi
 #define SPI_PORT spi0
-#define SPI_CLK 6
-#define SPI_TX 7
-#define SPI_RX 8
-#define SPI_CS 9
+#define SPI_CLK 18
+#define SPI_TX 19
+#define SPI_RX 20
+#define SPI_CS 21
 
 #define LED_PIN 25
 
