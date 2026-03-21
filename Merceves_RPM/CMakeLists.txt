@@ -51,6 +51,12 @@ target_link_libraries(Merceves_RPM
 # Add the standard include files to the build
 target_include_directories(Merceves_RPM PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
+        hardware_spi
+        hardware_adc
+        hardware_pwm
+        pico_multicore
+        pico_time
+        pico_stdlib
 )
 
 # Add any user requested libraries
