@@ -26,11 +26,8 @@
 #define M2INA_PIN 12
 #define M2INB_PIN 13
 
-// rpm
-#define RPM_PIN_L 27
-#define RPM_PIN_R 28
-
 // spi
+#define SPI_PORT spi0
 #define SPI_CLK 6
 #define SPI_TX 7
 #define SPI_RX 8
@@ -47,19 +44,11 @@ const int min_step_angle = 600;
 const int max_step_angle = 1000;
 
 volatile int current_step_angle;
-volatile int pulse_count_L = 0;
-volatile int pulse_count_R = 0;
 
 volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
 volatile int requested_angle = 800;
 
-volatile double speed_L = 0;
-volatile double speed_R = 0;
-
-const int magnets_per_wheel = 68;
-
-volatile bool spi_transfer_requested = false;
 
 static inline int pollADC() {
     return floorf((adc_read() * steps_per_rev) / 4095.0f);
@@ -71,104 +60,95 @@ int time_ms() {
 
 void handle_spi_transfer() {
 
-    uint8_t tx_buffer[18];
-    uint8_t rx_buffer[18];
+    // spi input is in the format of:
+    // [0] = 0xAA (start byte)
+    // [1..9] = speed data (double, 8 bytes)
+    // [10...17] = steering data (double, 8 bytes)
+    // 18 => XOR checksum of bytes [0..17]
 
-    tx_buffer[0] = 0xAA;
-
-    memcpy(&tx_buffer[1], &speed_L, sizeof(double));
-    memcpy(&tx_buffer[9], &speed_R, sizeof(double));
-
-    uint8_t checksum = 0;
-    for(int i = 1; i < 17; i++)
-        checksum ^= tx_buffer[i];
-
-    tx_buffer[17] = checksum;
-
-    //printf("reading...\n");
-
-    for (int i = 0; i < 18; i++) {
-        uint8_t b = 0;
-        //printf("reading %d byte\n", i);
-
-        spi_read_blocking(spi0, tx_buffer[i], &b, 1);
-        //printf("read %d byte\n", i);
-        rx_buffer[i] = b;
-    }
-
-    // spi_read_blocking(spi0, 0x01, &rx_buffer, 18);
-
-    // spi_write_read_blocking(spi0, tx_buffer, rx_buffer, 18);
-
-    //printf("read!\n");
-
-    // if(rx_buffer[0] != 0xAA)
-    //     return;
-    back:
-    checksum = 0;
-    for(int i = 1; i < 17; i++) {
-        //printf("%x, ", rx_buffer[i]);
-        checksum ^= rx_buffer[i];
-    }
-
-    //printf("\n");
-
-    if(checksum != rx_buffer[17]) {
-        //printf("checksum failed :(");
-        uint8_t b = 0;
-        while(b != 0xAA) {
-            spi_read_blocking(spi0, 0xAA, &b, 1);
+    // first we'll wait till we see a 0xAA byte
+    printf("Waiting for data...\n"); 
+    bool data_received = false;
+    while (!data_received) {
+        uint8_t rx_byte = 0;
+        spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
+        if (rx_byte == 0xAA) {
+            data_received = true;
         }
-        rx_buffer[0] = 0xAA;
-        for (int i = 1; i < 18; i++) {
-            uint8_t b = 0;
-            //printf("reading %d byte\n", i);
+    }
 
-            spi_read_blocking(spi0, tx_buffer[i], &b, 1);
-            //printf("read %d byte\n", i);
-            rx_buffer[i] = b;
+    printf("Data received, entering main loop...\n");
+    
+    // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
+    for (int i = 0; i < 17; i++) {
+        uint8_t byte = 0;
+        spi_read_blocking(SPI_PORT, 0x00, NULL, 1);
+    }
+
+    while (true) {
+        // do a wait for start byte again
+        data_received = false;
+        while (!data_received) {
+            uint8_t rx_byte = 0;
+            spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
+            if (rx_byte == 0xAA) {
+                data_received = true;
+            }
         }
-        goto back;
-        return;
-    }
 
-    double speed_cmd;
-    double angle_cmd;
+        // get data from spi
+        uint8_t rx_data[17] = {0};
 
-    memcpy(&speed_cmd, &rx_buffer[1], sizeof(double));
-    memcpy(&angle_cmd, &rx_buffer[9], sizeof(double));
+        // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
+        for (int i = 0; i < 17; i++) {
+            uint8_t byte = 0;
+            spi_read_blocking(SPI_PORT, 0x00, &byte, 1);
+            printf("Read byte %d: %02X\n", i, byte);
+            rx_data[i] = byte;
+        }
+        
+        
+        double speed = 0.0;
+        double steering = 0.0;
 
-    if(speed_cmd > 0) {
-        requested_dir = 0;
-    } else {
-        requested_dir = 1;
-        speed_cmd *= -1;
-    }
+        // calculate checksum
+        uint8_t checksum = 0;
+        for (int i = 0; i < 16; i++) {
+            checksum ^= rx_data[i];
+        }
 
-    requested_speed = (int)round(speed_cmd);
+        printf("Received checksum: %02X, Calculated checksum: %02X\n", rx_data[16], checksum);
 
-    requested_angle = (int)(400.0f * ((angle_cmd + (m_pi/2.0f)) / (m_pi))) + 600;
+        if (checksum == rx_data[16]) { // make sure checksum matches
+            // valid data, extract speed and steering
+            memcpy(&speed, &rx_data[0], sizeof(double));
+            memcpy(&steering, &rx_data[8], sizeof(double));
 
-    printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed_cmd, angle_cmd, requested_speed, requested_angle);
-}
+            if(speed > 0) {
+                requested_dir = 0;
+            } else {
+                requested_dir = 1;
+                speed *= -1;
+            }
 
-void gpio_interrupt(uint gpio, uint32_t events) {
-    if(gpio == RPM_PIN_L && (events & GPIO_IRQ_EDGE_RISE)) {
-        pulse_count_L++;
-    }
+            requested_speed = (int)round(speed);
 
-    if(gpio == RPM_PIN_R && (events & GPIO_IRQ_EDGE_RISE)) {
-        pulse_count_R++;
-    }
+            requested_angle = (int)(400.0f * ((steering + (m_pi/2.0f)) / (m_pi))) + 600;
+
+            printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed, steering, requested_speed, requested_angle);
+            
+        } else {
+            //printf("Checksum error!\n");
+        }
+    } 
+
+    
 }
 
 void core1_entry() {
 
     while (true) {
-
-        
         handle_spi_transfer();
-        // sleep_us(100);
     }
 }
 
@@ -208,14 +188,6 @@ int main() {
     current_step_angle = 800;
 
 
-    gpio_init(RPM_PIN_L);
-    gpio_set_dir(RPM_PIN_L, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(RPM_PIN_L, GPIO_IRQ_EDGE_RISE, true, &gpio_interrupt);
-
-    gpio_init(RPM_PIN_R);
-    gpio_set_dir(RPM_PIN_R, GPIO_IN);
-    gpio_set_irq_enabled(RPM_PIN_R, GPIO_IRQ_EDGE_RISE, true);
-
     spi_init(spi0, 1000*500);
     spi_set_slave(spi0, true);
 
@@ -234,7 +206,6 @@ int main() {
 
     while (true) {
         int adc_value = requested_angle;
-        //int adc_value = pollADC();
         int error = current_step_angle - adc_value;
 
         uint dc_slice_num = pwm_gpio_to_slice_num(DC_PWM_PIN);
@@ -271,13 +242,5 @@ int main() {
             }
         }
         
-        if(time_ms() - last_time > 100) {
-            speed_L = (pulse_count_L * 2 * 2 * M_PI) / magnets_per_wheel;
-            speed_R = (pulse_count_R * 2 * 2 * M_PI) / magnets_per_wheel;
-
-            pulse_count_L = 0;
-            pulse_count_R = 0;
-        }
-        //printf("L rad/s: %f  R rad/s: %f\n", speed_L, speed_R);
     }
 }
