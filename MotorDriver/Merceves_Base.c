@@ -21,8 +21,8 @@
 // dc driver
 // B is forwards and A is backwards
 #define DC_PWM_PIN 0
-#define M1INA_PIN 14
-#define M1INB_PIN 15
+#define M1INA_PIN 16
+#define M1INB_PIN 17
 #define M2INA_PIN 12
 #define M2INB_PIN 13
 
@@ -210,6 +210,7 @@ int main() {
 
         uint dc_slice_num = pwm_gpio_to_slice_num(DC_PWM_PIN);
         pwm_set_chan_level(dc_slice_num, PWM_CHAN_A, requested_speed);
+        //pwm_set_chan_level(dc_slice_num, PWM_CHAN_A, 1000);
 
         if(requested_dir == 0) {
             gpio_put(M1INA_PIN, 0);
