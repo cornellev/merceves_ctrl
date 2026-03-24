@@ -21,8 +21,8 @@
 // dc driver
 // B is forwards and A is backwards
 #define DC_PWM_PIN 0
-#define M1INA_PIN 14
-#define M1INB_PIN 15
+#define M1INA_PIN 10
+#define M1INB_PIN 11
 #define M2INA_PIN 12
 #define M2INB_PIN 13
 
@@ -49,6 +49,9 @@ volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
 volatile int requested_angle = 800;
 
+volatile bool step_state = false;
+volatile int steps_remaining = 0;
+struct repeating_timer step_timer;
 
 static inline int pollADC() {
     return floorf((adc_read() * steps_per_rev) / 4095.0f);
@@ -103,7 +106,7 @@ void handle_spi_transfer() {
         for (int i = 0; i < 17; i++) {
             uint8_t byte = 0;
             spi_read_blocking(SPI_PORT, 0x00, &byte, 1);
-            printf("Read byte %d: %02X\n", i, byte);
+            //printf("Read byte %d: %02X\n", i, byte);
             rx_data[i] = byte;
         }
         
@@ -117,7 +120,7 @@ void handle_spi_transfer() {
             checksum ^= rx_data[i];
         }
 
-        printf("Received checksum: %02X, Calculated checksum: %02X\n", rx_data[16], checksum);
+        //printf("Received checksum: %02X, Calculated checksum: %02X\n", rx_data[16], checksum);
 
         if (checksum == rx_data[16]) { // make sure checksum matches
             // valid data, extract speed and steering
@@ -143,6 +146,25 @@ void handle_spi_transfer() {
     } 
 
     
+}
+
+bool stepper_timer_callback(struct repeating_timer *t) {
+    if (steps_remaining > 0) {
+        step_state = !step_state;
+        gpio_put(STEP_PIN, step_state);
+
+        if (step_state) { //only counting on the rising edge
+            steps_remaining--;
+            if (requested_angle < current_step_angle) {
+                current_step_angle--;
+            } else if (requested_angle > current_step_angle) {
+                current_step_angle++;
+            }
+        }
+    } else {
+        gpio_put(STEP_PIN, 0);
+    }
+    return true;
 }
 
 void core1_entry() {
@@ -203,6 +225,7 @@ int main() {
     multicore_launch_core1(core1_entry);
 
     int last_time = time_ms();
+    add_repeating_timer_us(-300, stepper_timer_callback, NULL, &step_timer);
 
     while (true) {
         int adc_value = requested_angle;
@@ -229,16 +252,8 @@ int main() {
 
             if((error > 0 && current_step_angle > min_step_angle) ||
                (error < 0 && current_step_angle < max_step_angle)) {
-
-                for(int i = 0; i < 25; i++) {
-
-                    gpio_put(STEP_PIN, 1);
-                    sleep_us(300);
-                    gpio_put(STEP_PIN, 0);
-                    sleep_us(300);
-                }
-
-                current_step_angle += error > 0 ? -1 : 1;
+                gpio_put(DIR_PIN, error > 0 ? 0 : 1);
+                steps_remaining = 25;
             }
         }
         
