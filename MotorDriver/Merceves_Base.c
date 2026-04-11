@@ -26,6 +26,10 @@
 #define M2INA_PIN 12
 #define M2INB_PIN 13
 
+//rpm pins
+#define LEFT_WHEEL_PIN  10
+#define RIGHT_WHEEL_PIN 11
+
 // spi
 #define SPI_PORT spi0
 #define SPI_CLK 18
@@ -49,9 +53,18 @@ volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
 volatile int requested_angle = 1000;
 
+const int magnets_per_rev = 68;
+
+volatile int left_pulse = 0;
+volatile int right_pulse = 0;
+
+volatile double left_rpm = 0;
+volatile double right_rpm = 0;
+
 volatile bool step_state = false;
 volatile int steps_remaining = 0;
 struct repeating_timer step_timer;
+struct repeating_timer rpm_timer;
 
 static inline int pollADC() {
     return floorf((adc_read() * steps_per_rev) / 4095.0f);
@@ -167,6 +180,40 @@ bool stepper_timer_callback(struct repeating_timer *t) {
     return true;
 }
 
+void rpm_timer_callback(struct repeating_timer *t) {
+    static absolute_time_t last_time;
+    absolute_time_t now = get_absolute_time();
+
+    float dt = absolute_time_diff_us(last_time, now) / 1e6;
+    last_time = now;
+
+    int left, right;
+
+    // atomic snapshot
+    uint32_t irq_state = save_and_disable_interrupts();
+    left = left_pulse;
+    right = right_pulse;
+    left_pulse = 0;
+    right_pulse = 0;
+    restore_interrupts(irq_state);
+
+    float left_rpm  = (left  * 60.0f) / (magnets_per_rev * dt);
+    float right_rpm = (right * 60.0f) / (magnets_per_rev * dt);
+
+    printf("L: %.2f RPM | R: %.2f RPM\n", left_rpm, right_rpm);
+
+    return true;
+}
+
+void hall_sensor_callback(uint gpio, uint32_t events) {
+    if(gpio==LEFT_WHEEL_PIN) {
+        left_pulse++;
+    }
+    else if(gpio==RIGHT_WHEEL_PIN) {
+        right_pulse++;
+    }
+}
+
 void core1_entry() {
 
     while (true) {
@@ -207,7 +254,28 @@ int main() {
     gpio_set_dir(M2INB_PIN, GPIO_OUT);
 
 
-    current_step_angle = 800;
+    current_step_angle = 1000;
+
+    gpio_init(RIGHT_WHEEL_PIN);
+    gpio_set_dir(RIGHT_WHEEL_PIN, GPIO_IN);
+
+    gpio_init(LEFT_WHEEL_PIN);
+    gpio_set_dir(LEFT_WHEEL_PIN, GPIO_IN);
+
+    gpio_set_irq_enabled_with_callback(
+        RIGHT_WHEEL_PIN,
+        GPIO_IRQ_EDGE_FALL,
+        true,
+        &hall_sensor_callback
+    );
+
+    gpio_set_irq_enabled_with_callback(
+        LEFT_WHEEL_PIN,
+        GPIO_IRQ_EDGE_FALL,
+        true,
+        &hall_sensor_callback
+    );
+
 
 
     spi_init(spi0, 1000*500);
@@ -226,6 +294,7 @@ int main() {
 
     int last_time = time_ms();
     add_repeating_timer_us(-300, stepper_timer_callback, NULL, &step_timer);
+    add_repeating_timer_ns(-6667, rpm_timer_callback, NULL, &rpm_timer);
 
     while (true) {
         int adc_value = requested_angle;
@@ -254,7 +323,7 @@ int main() {
             if((error > 0 && current_step_angle > min_step_angle) ||
                (error < 0 && current_step_angle < max_step_angle)) {
                 gpio_put(DIR_PIN, error > 0 ? 0 : 1);
-                steps_remaining = 25;
+                steps_remaining = 1;
             }
         }
         
