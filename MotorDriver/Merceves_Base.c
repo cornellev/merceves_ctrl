@@ -180,7 +180,7 @@ bool stepper_timer_callback(struct repeating_timer *t) {
     return true;
 }
 
-void rpm_timer_callback(struct repeating_timer *t) {
+bool rpm_timer_callback(struct repeating_timer *t) {
     static absolute_time_t last_time;
     absolute_time_t now = get_absolute_time();
 
@@ -294,7 +294,7 @@ int main() {
 
     int last_time = time_ms();
     add_repeating_timer_us(-300, stepper_timer_callback, NULL, &step_timer);
-    add_repeating_timer_ns(-6667, rpm_timer_callback, NULL, &rpm_timer);
+    add_repeating_timer_us(-6667, rpm_timer_callback, NULL, &rpm_timer);
 
     while (true) {
         int adc_value = requested_angle;
