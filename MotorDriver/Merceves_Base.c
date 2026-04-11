@@ -21,8 +21,8 @@
 // dc driver
 // B is forwards and A is backwards
 #define DC_PWM_PIN 0
-#define M1INA_PIN 10
-#define M1INB_PIN 11
+#define M1INA_PIN 16
+#define M1INB_PIN 17
 #define M2INA_PIN 12
 #define M2INB_PIN 13
 
@@ -40,14 +40,14 @@ const double m_pi = 3.14159265358979323846f;
 const int steps_per_rev = 1600;
 const int margin_of_error = 2;
 
-const int min_step_angle = 600;
-const int max_step_angle = 1000;
+const int min_step_angle = 0;
+const int max_step_angle = 2000;
 
 volatile int current_step_angle;
 
 volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
-volatile int requested_angle = 800;
+volatile int requested_angle = 1000;
 
 volatile bool step_state = false;
 volatile int steps_remaining = 0;
@@ -136,7 +136,7 @@ void handle_spi_transfer() {
 
             requested_speed = (int)round(speed);
 
-            requested_angle = (int)(400.0f * ((steering + (m_pi/2.0f)) / (m_pi))) + 600;
+            requested_angle = (int)(2000.0f * ((steering + (m_pi/2.0f)) / (m_pi))); 
 
             printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed, steering, requested_speed, requested_angle);
             
