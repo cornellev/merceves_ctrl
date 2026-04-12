@@ -76,71 +76,66 @@ int time_ms() {
 
 void handle_spi_transfer() {
 
-    // spi input is in the format of:
-    // [0] = 0xAA (start byte)
-    // [1..9] = speed data (double, 8 bytes)
-    // [10...17] = steering data (double, 8 bytes)
-    // 18 => XOR checksum of bytes [0..17]
+    // Protocol (Pi -> Pico):
+    //   [0]     = 0xAA (start byte)
+    //   [1..8]  = speed (double, 8 bytes)
+    //   [9..16] = steering (double, 8 bytes)
+    //   [17]    = XOR checksum of bytes [1..16]
+    //
+    // Protocol (Pico -> Pi, simultaneous):
+    //   [0]     = 0xAA (start byte)
+    //   [1..8]  = left_rpm (double, 8 bytes)
+    //   [9..16] = right_rpm (double, 8 bytes)
+    //   [17]    = XOR checksum of bytes [1..16]
 
-    // first we'll wait till we see a 0xAA byte
-    printf("Waiting for data...\n"); 
-    bool data_received = false;
-    while (!data_received) {
-        uint8_t rx_byte = 0;
-        spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
-        if (rx_byte == 0xAA) {
-            data_received = true;
-        }
-    }
+    // Initial alignment: find 0xAA start byte, sending 0x00
+    printf("Waiting for alignment...\n");
+    uint8_t rx_byte = 0, tx_byte = 0;
+    do {
+        spi_write_read_blocking(SPI_PORT, &tx_byte, &rx_byte, 1);
+    } while (rx_byte != 0xAA);
 
-    printf("Data received, entering main loop...\n");
-    
-    // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
-    for (int i = 0; i < 17; i++) {
-        uint8_t byte = 0;
-        spi_read_blocking(SPI_PORT, 0x00, NULL, 1);
-    }
+    // Discard the rest of the first frame to get aligned
+    uint8_t discard[17] = {0};
+    uint8_t dummy[17]   = {0};
+    spi_write_read_blocking(SPI_PORT, dummy, discard, 17);
+
+    printf("Aligned. Entering main loop...\n");
 
     while (true) {
-        // do a wait for start byte again
-        data_received = false;
-        while (!data_received) {
-            uint8_t rx_byte = 0;
-            spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
-            if (rx_byte == 0xAA) {
-                data_received = true;
-            }
-        }
+        // Build response with current RPM values
+        uint8_t tx_buf[18] = {0};
+        tx_buf[0] = 0xAA;
+        double l = left_rpm;
+        double r = right_rpm;
+        memcpy(&tx_buf[1], &l, sizeof(double));
+        memcpy(&tx_buf[9], &r, sizeof(double));
+        uint8_t cs = 0;
+        for (int i = 1; i < 17; i++) cs ^= tx_buf[i];
+        tx_buf[17] = cs;
 
-        // get data from spi
+        // Wait for next start byte, sending first byte of response simultaneously
+        do {
+            spi_write_read_blocking(SPI_PORT, &tx_buf[0], &rx_byte, 1);
+        } while (rx_byte != 0xAA);
+
+        // Receive remaining 17 bytes while sending rest of response
         uint8_t rx_data[17] = {0};
+        spi_write_read_blocking(SPI_PORT, &tx_buf[1], rx_data, 17);
 
-        // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
-        for (int i = 0; i < 17; i++) {
-            uint8_t byte = 0;
-            spi_read_blocking(SPI_PORT, 0x00, &byte, 1);
-            //printf("Read byte %d: %02X\n", i, byte);
-            rx_data[i] = byte;
-        }
-        
-        
-        double speed = 0.0;
-        double steering = 0.0;
-
-        // calculate checksum
+        // Validate checksum (rx_data[0..7]=speed, [8..15]=steering, [16]=checksum)
         uint8_t checksum = 0;
         for (int i = 0; i < 16; i++) {
             checksum ^= rx_data[i];
         }
 
-        //printf("Received checksum: %02X, Calculated checksum: %02X\n", rx_data[16], checksum);
-
-        if (checksum == rx_data[16]) { // make sure checksum matches
-            // valid data, extract speed and steering
+        if (checksum == rx_data[16]) {
+            double speed = 0.0;
+            double steering = 0.0;
             memcpy(&speed, &rx_data[0], sizeof(double));
             memcpy(&steering, &rx_data[8], sizeof(double));
 
-            if(speed > 0) {
+            if (speed > 0) {
                 requested_dir = 0;
             } else {
                 requested_dir = 1;
@@ -148,17 +143,12 @@ void handle_spi_transfer() {
             }
 
             requested_speed = (int)round(speed);
+            requested_angle = (int)(2000.0f * ((steering + (m_pi/2.0f)) / (m_pi)));
 
-            requested_angle = (int)(2000.0f * ((steering + (m_pi/2.0f)) / (m_pi))); 
-
-            printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed, steering, requested_speed, requested_angle);
-            
-        } else {
-            //printf("Checksum error!\n");
+            printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n",
+                   speed, steering, requested_speed, requested_angle);
         }
-    } 
-
-    
+    }
 }
 
 bool stepper_timer_callback(struct repeating_timer *t) {
@@ -197,10 +187,11 @@ bool rpm_timer_callback(struct repeating_timer *t) {
     right_pulse = 0;
     restore_interrupts(irq_state);
 
-    float left_rpm  = (left  * 60.0f) / (magnets_per_rev * dt);
-    float right_rpm = (right * 60.0f) / (magnets_per_rev * dt);
+    left_rpm  = (left  * 60.0) / (magnets_per_rev * dt);
+    right_rpm = (right * 60.0) / (magnets_per_rev * dt);
 
-    printf("L: %.2f RPM | R: %.2f RPM\n", left_rpm, right_rpm);
+    if (left_rpm !=0 || right_rpm !=0)
+      printf("L: %.2f RPM | R: %.2f RPM\n", left_rpm, right_rpm);
 
     return true;
 }
@@ -269,11 +260,10 @@ int main() {
         &hall_sensor_callback
     );
 
-    gpio_set_irq_enabled_with_callback(
+    gpio_set_irq_enabled(
         LEFT_WHEEL_PIN,
         GPIO_IRQ_EDGE_FALL,
-        true,
-        &hall_sensor_callback
+        true
     );
 
 

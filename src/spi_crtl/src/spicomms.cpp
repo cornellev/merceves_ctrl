@@ -70,10 +70,10 @@ public:
         //         throw_errno("SPI_IOC_MESSAGE (byte transfer)");
         //     }
         // }
-      tr.len = tx.size();
-      ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
+       tr.len = tx.size();
+       ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
 
-        return rx;
+       return rx;
     }
 
     // Write-only convenience
