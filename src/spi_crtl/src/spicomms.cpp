@@ -61,17 +61,17 @@ public:
 
         // go byte-by-byte and transfer
 	
-        for (size_t i = 0; i < tx.size(); ++i) {
-            tr.len = 1;
-            tr.tx_buf = reinterpret_cast<__u64>(tx.data() + i);
-            tr.rx_buf = reinterpret_cast<__u64>(rx.data() + i);
-            int ret = ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
-            if (ret < 1) {
-                throw_errno("SPI_IOC_MESSAGE (byte transfer)");
-            }
-        }
-	//tr.len = tx.size();
-	//ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
+        // for (size_t i = 0; i < tx.size(); ++i) {
+        //     tr.len = 1;
+        //     tr.tx_buf = reinterpret_cast<__u64>(tx.data() + i);
+        //     tr.rx_buf = reinterpret_cast<__u64>(rx.data() + i);
+        //     int ret = ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
+        //     if (ret < 1) {
+        //         throw_errno("SPI_IOC_MESSAGE (byte transfer)");
+        //     }
+        // }
+      tr.len = tx.size();
+      ioctl(fd_, SPI_IOC_MESSAGE(1), &tr);
 
         return rx;
     }
