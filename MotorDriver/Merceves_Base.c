@@ -11,6 +11,7 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/multicore.h"
+#include "pico/sync.h"
 #include "stepper.h"
 
 #define ADC_PIN 26
@@ -61,6 +62,8 @@ volatile int right_pulse = 0;
 volatile double left_rpm = 0;
 volatile double right_rpm = 0;
 
+spin_lock_t *rpm_spin_lock;
+
 volatile bool step_state = false;
 volatile int steps_remaining = 0;
 struct repeating_timer step_timer;
@@ -88,52 +91,49 @@ void handle_spi_transfer() {
     //   [9..16] = right_rpm (double, 8 bytes)
     //   [17]    = XOR checksum of bytes [1..16]
 
-    // Initial alignment: find 0xAA start byte, sending 0x00
-    printf("Waiting for alignment...\n");
-    uint8_t rx_byte = 0, tx_byte = 0;
-    do {
-        spi_write_read_blocking(SPI_PORT, &tx_byte, &rx_byte, 1);
-    } while (rx_byte != 0xAA);
-
-    // Discard the rest of the first frame to get aligned
-    uint8_t discard[17] = {0};
-    uint8_t dummy[17]   = {0};
-    spi_write_read_blocking(SPI_PORT, dummy, discard, 17);
-
-    printf("Aligned. Entering main loop...\n");
+    printf("Entering SPI main loop...\n");
 
     while (true) {
-        // Build response with current RPM values
+        // Build TX frame with current RPM values (spinlock-protected read)
         uint8_t tx_buf[18] = {0};
         tx_buf[0] = 0xAA;
+
+        uint32_t irq = spin_lock_blocking(rpm_spin_lock);
         double l = left_rpm;
         double r = right_rpm;
+        spin_unlock(rpm_spin_lock, irq);
+
         memcpy(&tx_buf[1], &l, sizeof(double));
         memcpy(&tx_buf[9], &r, sizeof(double));
         uint8_t cs = 0;
         for (int i = 1; i < 17; i++) cs ^= tx_buf[i];
         tx_buf[17] = cs;
 
-        // Wait for next start byte, sending first byte of response simultaneously
-        do {
-            spi_write_read_blocking(SPI_PORT, &tx_buf[0], &rx_byte, 1);
-        } while (rx_byte != 0xAA);
+        // Single atomic 18-byte full-duplex transfer.
+        // Slave blocks here until the master clocks all 18 bytes.
+        // This avoids the FIFO overflow that happened when we split
+        // the transfer into 1 + 17 bytes with a gap in between.
+        uint8_t rx_buf[18] = {0};
+        spi_write_read_blocking(SPI_PORT, tx_buf, rx_buf, 18);
 
-        // Receive remaining 17 bytes while sending rest of response
-        uint8_t rx_data[17] = {0};
-        spi_write_read_blocking(SPI_PORT, &tx_buf[1], rx_data, 17);
-
-        // Validate checksum (rx_data[0..7]=speed, [8..15]=steering, [16]=checksum)
-        uint8_t checksum = 0;
-        for (int i = 0; i < 16; i++) {
-            checksum ^= rx_data[i];
+        // Validate: check start byte and checksum
+        if (rx_buf[0] != 0xAA) {
+            // Frame misaligned — discard and retry next frame.
+            // The master sends 0xAA as byte 0 every frame, so
+            // alignment self-corrects within one frame.
+            continue;
         }
 
-        if (checksum == rx_data[16]) {
+        uint8_t checksum = 0;
+        for (int i = 1; i < 17; i++) {
+            checksum ^= rx_buf[i];
+        }
+
+        if (checksum == rx_buf[17]) {
             double speed = 0.0;
             double steering = 0.0;
-            memcpy(&speed, &rx_data[0], sizeof(double));
-            memcpy(&steering, &rx_data[8], sizeof(double));
+            memcpy(&speed, &rx_buf[1], sizeof(double));
+            memcpy(&steering, &rx_buf[9], sizeof(double));
 
             if (speed > 0) {
                 requested_dir = 0;
@@ -187,11 +187,16 @@ bool rpm_timer_callback(struct repeating_timer *t) {
     right_pulse = 0;
     restore_interrupts(irq_state);
 
-    left_rpm  = (left  * 60.0) / (magnets_per_rev * dt);
-    right_rpm = (right * 60.0) / (magnets_per_rev * dt);
+    double new_left  = (left  * 60.0) / (magnets_per_rev * dt);
+    double new_right = (right * 60.0) / (magnets_per_rev * dt);
 
-    if (left_rpm !=0 || right_rpm !=0)
-      printf("L: %.2f RPM | R: %.2f RPM\n", left_rpm, right_rpm);
+    uint32_t irq = spin_lock_blocking(rpm_spin_lock);
+    left_rpm  = new_left;
+    right_rpm = new_right;
+    spin_unlock(rpm_spin_lock, irq);
+
+    if (new_left != 0 || new_right != 0)
+      printf("L: %.2f RPM | R: %.2f RPM\n", new_left, new_right);
 
     return true;
 }
@@ -279,7 +284,9 @@ int main() {
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
-    
+
+    rpm_spin_lock = spin_lock_init(spin_lock_claim_unused(true));
+
     multicore_launch_core1(core1_entry);
 
     int last_time = time_ms();
