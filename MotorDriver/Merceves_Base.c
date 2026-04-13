@@ -11,6 +11,7 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/multicore.h"
+#include "pico/sync.h"
 #include "stepper.h"
 
 #define ADC_PIN 26
@@ -53,13 +54,26 @@ volatile int requested_speed = 0;
 volatile int requested_dir = 0; //0 is forward, 1 is backward
 volatile int requested_angle = 1000;
 
-const int magnets_per_rev = 68;
+// 68 alternating magnets = 68 poles. Counting both edges gives
+// 2 edges per pole transition cycle, but with alternating N-S there
+// are 68 distinct transitions per revolution when using both edges
+// on a bipolar hall sensor. Adjust this if your sensor is omnipolar.
+const int edges_per_rev = 68;
 
-volatile int left_pulse = 0;
-volatile int right_pulse = 0;
+// Period-based RPM: the ISR records the time between consecutive
+// edges. The RPM timer reads these to compute RPM.
+volatile uint32_t left_last_period_us = 0;
+volatile uint32_t left_prev_time_us = 0;
+volatile uint32_t right_last_period_us = 0;
+volatile uint32_t right_prev_time_us = 0;
 
+// RPM values shared between core 0 (timer) and core 1 (SPI)
 volatile double left_rpm = 0;
 volatile double right_rpm = 0;
+spin_lock_t *rpm_spin_lock;
+
+// Timeout: if no edge for this long, wheel is stopped
+#define RPM_TIMEOUT_US 500000  // 500 ms
 
 volatile bool step_state = false;
 volatile int steps_remaining = 0;
@@ -76,71 +90,60 @@ int time_ms() {
 
 void handle_spi_transfer() {
 
-    // spi input is in the format of:
-    // [0] = 0xAA (start byte)
-    // [1..9] = speed data (double, 8 bytes)
-    // [10...17] = steering data (double, 8 bytes)
-    // 18 => XOR checksum of bytes [0..17]
+    // Protocol (Jetson -> Pico):
+    //   [0]     = 0xAA (start byte)
+    //   [1..8]  = speed (double, 8 bytes)
+    //   [9..16] = steering (double, 8 bytes)
+    //   [17]    = XOR checksum of bytes [1..16]
+    //
+    // Protocol (Pico -> Jetson, simultaneous):
+    //   [0]     = 0xAA (start byte)
+    //   [1..8]  = left_rpm (double, 8 bytes)
+    //   [9..16] = right_rpm (double, 8 bytes)
+    //   [17]    = XOR checksum of bytes [1..16]
 
-    // first we'll wait till we see a 0xAA byte
-    printf("Waiting for data...\n"); 
-    bool data_received = false;
-    while (!data_received) {
-        uint8_t rx_byte = 0;
-        spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
-        if (rx_byte == 0xAA) {
-            data_received = true;
-        }
-    }
-
-    printf("Data received, entering main loop...\n");
-    
-    // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
-    for (int i = 0; i < 17; i++) {
-        uint8_t byte = 0;
-        spi_read_blocking(SPI_PORT, 0x00, NULL, 1);
-    }
+    printf("Entering SPI main loop...\n");
 
     while (true) {
-        // do a wait for start byte again
-        data_received = false;
-        while (!data_received) {
-            uint8_t rx_byte = 0;
-            spi_read_blocking(SPI_PORT, 0x00, &rx_byte, 1);
-            if (rx_byte == 0xAA) {
-                data_received = true;
-            }
+        // Build TX frame with current RPM values (spinlock-protected read)
+        uint8_t tx_buf[18] = {0};
+        tx_buf[0] = 0xAA;
+
+        uint32_t irq = spin_lock_blocking(rpm_spin_lock);
+        double l = left_rpm;
+        double r = right_rpm;
+        spin_unlock(rpm_spin_lock, irq);
+
+        memcpy(&tx_buf[1], &l, sizeof(double));
+        memcpy(&tx_buf[9], &r, sizeof(double));
+        uint8_t cs = 0;
+        for (int i = 1; i < 17; i++) cs ^= tx_buf[i];
+        tx_buf[17] = cs;
+
+        // Single atomic 18-byte full-duplex transfer.
+        // The slave blocks here until the master clocks all 18 bytes.
+        // This avoids FIFO overflow from the old split 1+17 byte approach.
+        uint8_t rx_buf[18] = {0};
+        spi_write_read_blocking(SPI_PORT, tx_buf, rx_buf, 18);
+
+        // Validate start byte
+        if (rx_buf[0] != 0xAA) {
+            continue;  // misaligned — self-corrects next frame
         }
 
-        // get data from spi
-        uint8_t rx_data[17] = {0};
-
-        // stupid ahh spi read byte by byte because pico sdk spi_read_blocking is broken
-        for (int i = 0; i < 17; i++) {
-            uint8_t byte = 0;
-            spi_read_blocking(SPI_PORT, 0x00, &byte, 1);
-            //printf("Read byte %d: %02X\n", i, byte);
-            rx_data[i] = byte;
-        }
-        
-        
-        double speed = 0.0;
-        double steering = 0.0;
-
-        // calculate checksum
+        // Validate checksum
         uint8_t checksum = 0;
-        for (int i = 0; i < 16; i++) {
-            checksum ^= rx_data[i];
+        for (int i = 1; i < 17; i++) {
+            checksum ^= rx_buf[i];
         }
 
-        //printf("Received checksum: %02X, Calculated checksum: %02X\n", rx_data[16], checksum);
+        if (checksum == rx_buf[17]) {
+            double speed = 0.0;
+            double steering = 0.0;
+            memcpy(&speed, &rx_buf[1], sizeof(double));
+            memcpy(&steering, &rx_buf[9], sizeof(double));
 
-        if (checksum == rx_data[16]) { // make sure checksum matches
-            // valid data, extract speed and steering
-            memcpy(&speed, &rx_data[0], sizeof(double));
-            memcpy(&steering, &rx_data[8], sizeof(double));
-
-            if(speed > 0) {
+            if (speed > 0) {
                 requested_dir = 0;
             } else {
                 requested_dir = 1;
@@ -148,17 +151,12 @@ void handle_spi_transfer() {
             }
 
             requested_speed = (int)round(speed);
+            requested_angle = (int)(2000.0f * ((steering + (m_pi/2.0f)) / (m_pi)));
 
-            requested_angle = (int)(2000.0f * ((steering + (m_pi/2.0f)) / (m_pi))); 
-
-            printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n", speed, steering, requested_speed, requested_angle);
-            
-        } else {
-            //printf("Checksum error!\n");
+            printf("speed_cmd: %lf, angle_cmd: %lf\nrequested speed: %i, requested angle: %i\n",
+                   speed, steering, requested_speed, requested_angle);
         }
-    } 
-
-    
+    }
 }
 
 bool stepper_timer_callback(struct repeating_timer *t) {
@@ -181,36 +179,47 @@ bool stepper_timer_callback(struct repeating_timer *t) {
 }
 
 bool rpm_timer_callback(struct repeating_timer *t) {
-    static absolute_time_t last_time;
-    absolute_time_t now = get_absolute_time();
+    uint32_t now = time_us_32();
 
-    float dt = absolute_time_diff_us(last_time, now) / 1e6;
-    last_time = now;
-
-    int left, right;
-
-    // atomic snapshot
+    // Read last edge periods (atomic snapshot)
     uint32_t irq_state = save_and_disable_interrupts();
-    left = left_pulse;
-    right = right_pulse;
-    left_pulse = 0;
-    right_pulse = 0;
+    uint32_t l_period = left_last_period_us;
+    uint32_t l_prev   = left_prev_time_us;
+    uint32_t r_period = right_last_period_us;
+    uint32_t r_prev   = right_prev_time_us;
     restore_interrupts(irq_state);
 
-    float left_rpm  = (left  * 60.0f) / (magnets_per_rev * dt);
-    float right_rpm = (right * 60.0f) / (magnets_per_rev * dt);
+    // Compute RPM from period, or 0 if timed out (wheel stopped)
+    double new_left = 0.0;
+    double new_right = 0.0;
 
-    printf("L: %.2f RPM | R: %.2f RPM\n", left_rpm, right_rpm);
+    if (l_period > 0 && (now - l_prev) < RPM_TIMEOUT_US) {
+        new_left = 60000000.0 / ((double)l_period * edges_per_rev);
+    }
+    if (r_period > 0 && (now - r_prev) < RPM_TIMEOUT_US) {
+        new_right = 60000000.0 / ((double)r_period * edges_per_rev);
+    }
+
+    // Write to globals under spinlock (read by SPI handler on core 1)
+    uint32_t irq = spin_lock_blocking(rpm_spin_lock);
+    left_rpm  = new_left;
+    right_rpm = new_right;
+    spin_unlock(rpm_spin_lock, irq);
+
+    if (new_left != 0 || new_right != 0)
+        printf("L: %.2f RPM | R: %.2f RPM\n", new_left, new_right);
 
     return true;
 }
 
 void hall_sensor_callback(uint gpio, uint32_t events) {
-    if(gpio==LEFT_WHEEL_PIN) {
-        left_pulse++;
-    }
-    else if(gpio==RIGHT_WHEEL_PIN) {
-        right_pulse++;
+    uint32_t now = time_us_32();
+    if (gpio == LEFT_WHEEL_PIN) {
+        left_last_period_us = now - left_prev_time_us;
+        left_prev_time_us = now;
+    } else if (gpio == RIGHT_WHEEL_PIN) {
+        right_last_period_us = now - right_prev_time_us;
+        right_prev_time_us = now;
     }
 }
 
@@ -262,18 +271,18 @@ int main() {
     gpio_init(LEFT_WHEEL_PIN);
     gpio_set_dir(LEFT_WHEEL_PIN, GPIO_IN);
 
+    // Count both edges to get full resolution from alternating magnets
     gpio_set_irq_enabled_with_callback(
         RIGHT_WHEEL_PIN,
-        GPIO_IRQ_EDGE_FALL,
+        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
         true,
         &hall_sensor_callback
     );
 
-    gpio_set_irq_enabled_with_callback(
+    gpio_set_irq_enabled(
         LEFT_WHEEL_PIN,
-        GPIO_IRQ_EDGE_FALL,
-        true,
-        &hall_sensor_callback
+        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE,
+        true
     );
 
 
@@ -289,12 +298,15 @@ int main() {
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
-    
+
+    rpm_spin_lock = spin_lock_init(spin_lock_claim_unused(true));
+
     multicore_launch_core1(core1_entry);
 
     int last_time = time_ms();
     add_repeating_timer_us(-300, stepper_timer_callback, NULL, &step_timer);
-    add_repeating_timer_us(-6667, rpm_timer_callback, NULL, &rpm_timer);
+    // 10ms = 100Hz, matches Kalman filter update rate
+    add_repeating_timer_us(-10000, rpm_timer_callback, NULL, &rpm_timer);
 
     while (true) {
         int adc_value = requested_angle;

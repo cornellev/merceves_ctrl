@@ -1,7 +1,9 @@
 #include <iostream>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include "ackermann_msgs/msg/ackermann_drive.hpp"
@@ -9,30 +11,51 @@
 #include "spicomms.cpp"
 
 const std::string dev = "/dev/spidev0.1";
-uint32_t speedHz = 500'000;  // 1 MHz
+uint32_t speedHz = 500'000;  // 500 kHz
 
 SpiDevice spi(dev, speedHz, SPI_MODE_0, 8);
 
 class SPINode : public rclcpp::Node {
-    public:
-        SPINode() : Node("spi_node") {
-            subscription_ = this->create_subscription<ackermann_msgs::msg::AckermannDrive>("ackDrive", 10, std::bind(&SPINode::handle_ackermann_update, this, std::placeholders::_1));
-        }
+public:
+    SPINode() : Node("spi_node") {
+        subscription_ = this->create_subscription<ackermann_msgs::msg::AckermannDrive>(
+            "ackDrive", 10,
+            std::bind(&SPINode::handle_ackermann_update, this, std::placeholders::_1));
 
-    private:
+        // 100 Hz timer drives SPI transfers, matching the Kalman filter rate.
+        // Decoupled from ROS messages so RPM is always polled steadily.
+        spi_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(10),  // 100 Hz
+            std::bind(&SPINode::do_spi_transfer, this));
+    }
 
-	double left_speed, right_speed;
+private:
+    // Cached command values (updated by ROS callback, read by timer)
+    std::mutex cmd_mutex_;
+    double cached_speed_ = 0.0;
+    double cached_steering_ = 0.0;
+
+    double left_speed_ = 0.0;
+    double right_speed_ = 0.0;
 
     void handle_ackermann_update(const ackermann_msgs::msg::AckermannDrive::SharedPtr msg) {
-        //RCLCPP_INFO(this->get_logger(), "Received Ackermann Drive - Speed: '%f', Steering Angle: '%f'", msg->speed, msg->steering_angle);
-        double speed = msg->speed;
-        double steering_angle = msg->steering_angle;
-        // covnvert speed and steering angle to SPI data
-        std::vector<uint8_t> tx_data;
-        tx_data.reserve(1 + sizeof(speed) + sizeof(steering_angle) + 1);
-        // total size: 1 + 8 + 8 + 1 = 18 bytes
+        std::lock_guard<std::mutex> lock(cmd_mutex_);
+        cached_speed_ = msg->speed;
+        cached_steering_ = msg->steering_angle;
+    }
 
-        // Start byte (helps the receiver align to frames)
+    void do_spi_transfer() {
+        // Snapshot the latest command under the lock
+        double speed, steering_angle;
+        {
+            std::lock_guard<std::mutex> lock(cmd_mutex_);
+            speed = cached_speed_;
+            steering_angle = cached_steering_;
+        }
+
+        // Build 18-byte TX frame
+        std::vector<uint8_t> tx_data;
+        tx_data.reserve(18);
         tx_data.push_back(0xAA);
 
         auto append_double = [&tx_data](double value) {
@@ -43,90 +66,46 @@ class SPINode : public rclcpp::Node {
         append_double(speed);
         append_double(steering_angle);
 
-        // Simple XOR checksum over everything after the start byte
         uint8_t checksum = 0;
         for (std::size_t i = 1; i < 17; ++i) {
             checksum ^= tx_data[i];
         }
         tx_data.push_back(checksum);
 
-        // RCLCPP_INFO(this->get_logger(), "SPI write successful, sent %zu bytes", tx_data.size());
-        // RCLCPP_INFO(this->get_logger(), "Data bytes:");
-        // for (size_t i = 0; i < tx_data.size(); ++i) {
-        //     RCLCPP_INFO(this->get_logger(), "Byte %zu: 0x%02X", i, tx_data[i]);
-        // }
+        // Single atomic 18-byte full-duplex transfer
+        std::vector<uint8_t> rx_data = spi.transfer(tx_data);
 
-        // --- Actually send over SPI ---
-	/*
-	try {
-	    for (size_t i = 0; i < tx_data.size(); i++) {
-		std::vector<uint8_t> to_send = {tx_data[i]};
-		spi.write(to_send);
-	    }
-	} catch (const std::exception& e) {
-		RCLCPP_ERROR(this->get_logger(), "SPI write failed: %s", e.what());
-	}
-	*/
+        // Validate start byte
+        if (rx_data[0] != 0xAA) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "SPI frame misaligned (got 0x%02X, expected 0xAA), skipping", rx_data[0]);
+            return;
+        }
 
-	std::vector<uint8_t> rx_data = spi.transfer(tx_data);
-        
-        checksum:
-	checksum = 0;
-	for(std::size_t i = 1; i < rx_data.size() - 1; ++i) {
-             checksum ^= rx_data[i];
-	}
+        // Validate checksum over payload bytes [1..16]
+        checksum = 0;
+        for (std::size_t i = 1; i < 17; ++i) {
+            checksum ^= rx_data[i];
+        }
 
-	if(checksum == rx_data[rx_data.size() - 1]) {
-    	    uint64_t l_bytes = 0;
-            uint64_t r_bytes = 0;
+        if (checksum != rx_data[17]) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "SPI checksum mismatch, skipping frame");
+            return;
+        }
 
-	    for(int i = 1; i < 9; i++) {
-	        l_bytes |= (uint64_t)rx_data[i] << ((i-1)*8);
-	    }
+        // Unpack RPM doubles from response
+        std::memcpy(&left_speed_, &rx_data[1], sizeof(double));
+        std::memcpy(&right_speed_, &rx_data[9], sizeof(double));
 
-	    for(int i = 9; i < 17; i++) {
-		r_bytes |= (uint64_t)rx_data[i] << ((i-9)*8);
-	    }
-
-            std::memcpy(&left_speed, &l_bytes, sizeof(left_speed));
-	    std::memcpy(&right_speed, &r_bytes, sizeof(right_speed));
-
-	} else {
-	    RCLCPP_ERROR(this->get_logger(), "SPI checksum failed :(");
-	    std::vector<uint8_t> header_byte;
-	    header_byte.reserve(1);
-	    header_byte.push_back(0xAA);
-
-	    std::vector<uint8_t> tx_data_truncated(
-		tx_data.begin() + 1,
-		tx_data.begin() + 18
-	    );
-
-	    bool misaligned = true;
-	    std::vector<uint8_t> other_data;
-	    other_data.reserve(17);
-	    while(misaligned) {
-	        std::vector<uint8_t> header_back = spi.transfer(header_byte);
-		if(header_back[0] == 0xAA) {
-		    other_data = spi.transfer(tx_data_truncated);
-		    misaligned = false;
-		}
-	    }
-            rx_data[0] = 0xAA;
-	    RCLCPP_INFO(this->get_logger(), "length of other_data: %ld", other_data.size());
-	    for(int i = 0; i < 17; i++) {
-                rx_data[i+1] = other_data[i];
-	    }
-	    goto checksum;
-	}
-
-	if(left_speed > 0 || right_speed > 0) {
-		RCLCPP_INFO(this->get_logger(), "Left speed: %lf, Right speed: %lf", left_speed, right_speed);
-	}
-	// RCLCPP_INFO(this->get_logger(), "RX: %s", ([&]{ std::ostringstream s; for(uint8_t b : rx_data) s << std::hex << std::setw(2) << std::setfill('0') << (int)b << " "; return s.str(); })().c_str());
+        if (left_speed_ > 0 || right_speed_ > 0) {
+            RCLCPP_INFO(this->get_logger(), "Left RPM: %lf, Right RPM: %lf",
+                left_speed_, right_speed_);
+        }
     }
 
     rclcpp::Subscription<ackermann_msgs::msg::AckermannDrive>::SharedPtr subscription_;
+    rclcpp::TimerBase::SharedPtr spi_timer_;
 };
 
 int main(int argc, char * argv[]) {
