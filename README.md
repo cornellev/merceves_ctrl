@@ -20,5 +20,5 @@ To initiate SPI communications with the car, start the following node:
 ros2 run spicontrol spicontrol
 ```
 
-To interact with the spicontrol, send an ackermann steering message out with the name "ackDrive".
+**To interact with the spicontrol, send an ackermann steering message out with the name "ackDrive".**
 The spicontrol will listen to this message and use that information to control the car's motion
