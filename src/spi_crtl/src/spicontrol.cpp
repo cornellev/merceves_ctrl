@@ -18,8 +18,8 @@
 // are exposed as ROS parameters below (motor_usb_port / rpm_usb_port)
 // so they can be set from a launch file or config yaml without a
 // rebuild; the values here are just the fallback defaults.
-constexpr const char* kDefaultMotorUsbPort = "/dev/ttyACM0";
-constexpr const char* kDefaultRpmUsbPort = "/dev/ttyACM1";
+constexpr const char* kDefaultMotorUsbPort = "/dev/ttyACM1";
+constexpr const char* kDefaultRpmUsbPort = "/dev/ttyACM0";
 // The Picos present themselves as USB-CDC virtual serial ports, which
 // (unlike a real UART) transfer at full USB speed regardless of the
 // requested baud rate - termios still wants a value, so this is kept
