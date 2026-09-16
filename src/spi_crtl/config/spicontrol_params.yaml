@@ -1,0 +1,10 @@
+spicontrol:
+  ros__parameters:
+    # USB-serial device nodes for the two Pico boards. Update these to
+    # match wherever the boards actually enumerate on your Jetson
+    # (check with `ls /dev/ttyACM*` after plugging both in - the
+    # ordering isn't guaranteed to be stable across reboots/replugs,
+    # so consider pinning them with a udev rule if that becomes a
+    # problem).
+    motor_usb_port: "/dev/ttyACM0"
+    rpm_usb_port: "/dev/ttyACM1"
